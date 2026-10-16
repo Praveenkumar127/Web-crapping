@@ -1,157 +1,199 @@
 
 import os
-import time
+import logging
+from urllib.parse import urljoin
+
+import boto3
+import requests
 import pandas as pd
-
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+
+# Configure CloudWatch logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Lambda temporary storage
+OUTPUT_DIR = "/tmp/output"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# AWS clients
+ssm = boto3.client("ssm")
+s3_client = boto3.client("s3")
+sns_client = boto3.client("sns")
 
 
-# 1. Naukri job search URL
-url = "https://www.naukri.com/data-engineer-jobs?k=data%20engineer&nignbevent_src=jobsearchDeskGNB"
-
-
-# 2. CSV output location
-folder_path = (
-    r"C:\Users\Karpagam\OneDrive\Documents"
-    r"\Web crapping\naukri"
-)
-
-file_path = os.path.join(folder_path, "naukri_jobs.csv")
-os.makedirs(folder_path, exist_ok=True)
-
-
-# 3. Configure Chrome
-options = Options()
-options.add_argument("--start-maximized")
-
-# IMPORTANT:
-# Replace this example with the ACTUAL path to
-# your extracted chromedriver.exe file.
-driver_path = r"C:\Users\Karpagam\Downloads\chromedriver-win64\chromedriver-win64\chromedriver.exe"
-
-if not os.path.isfile(driver_path):
-    raise FileNotFoundError(
-        "ChromeDriver was not found at:\n"
-        + driver_path
-        + "\nPlease update driver_path to the actual "
-          "location of chromedriver.exe."
+def get_ssm_parameter(parameter_name):
+    """Retrieve a value from SSM Parameter Store."""
+    response = ssm.get_parameter(
+        Name=parameter_name
     )
-
-service = Service(driver_path)
-driver = webdriver.Chrome(
-    service=service,
-    options=options
-)
+    return response["Parameter"]["Value"]
 
 
-try:
-    # 4. Open Naukri
-    driver.get(url)
-
-    # Allow the page time to load
-    time.sleep(10)
-
-    # 5. Read the rendered HTML
-    soup = BeautifulSoup(
-        driver.page_source,
-        "html.parser"
+def send_notification(topic_arn, subject, message):
+    """Send an email using SNS."""
+    sns_client.publish(
+        TopicArn=topic_arn,
+        Subject=subject,
+        Message=message
     )
+    logger.info("SNS notification sent: %s", subject)
 
-    # 6. Find job cards
-    job_cards = soup.select(
-        "div.srp-jobtuple-wrapper, "
-        "div.cust-job-tuple, "
-        "article.jobTuple"
+
+def scrape_python_jobs(url):
+    logger.info("Starting Python job scraper")
+
+    response = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=20
     )
+    response.raise_for_status()
 
-    print("Job cards found:", len(job_cards))
+    logger.info("HTTP status: %s", response.status_code)
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    job_cards = soup.select("ol.list-recent-jobs > li")
+
+    logger.info("Job cards found: %s", len(job_cards))
 
     jobs = []
 
-    # 7. Extract job details
     for card in job_cards:
+        title_tag = card.select_one("h2 a")
+        company_tag = card.select_one(".listing-company-name")
+        location_tag = card.select_one(".listing-location")
+        date_tag = card.select_one(".listing-posted")
 
-        title_tag = card.select_one(
-            "a.title, a[class*='title']"
+        job_url = None
+
+        if title_tag and title_tag.get("href"):
+            job_url = urljoin(url, title_tag["href"])
+
+        jobs.append({
+            "Job Title": (
+                title_tag.get_text(" ", strip=True)
+                if title_tag else None
+            ),
+            "Job URL": job_url,
+            "Company": (
+                company_tag.get_text(" ", strip=True)
+                if company_tag else None
+            ),
+            "Location": (
+                location_tag.get_text(" ", strip=True)
+                if location_tag else None
+            ),
+            "Posted Date": (
+                date_tag.get_text(" ", strip=True)
+                if date_tag else None
+            )
+        })
+
+    if not jobs:
+        raise RuntimeError(
+            "No jobs found. Check the website structure."
         )
 
-        company_tag = card.select_one(
-            "a.comp-name, "
-            "a[class*='comp-name'], "
-            "span[class*='comp-name']"
+    logger.info("Total jobs extracted: %s", len(jobs))
+    return jobs
+
+
+def lambda_handler(event, context):
+    failure_arn = None
+
+    try:
+        # Read SNS failure ARN first so it may be used
+        # if another SSM parameter or processing step fails.
+        failure_arn = get_ssm_parameter(
+            "/data/errorarn/webcrap"
         )
 
-        location_tag = card.select_one(
-            "span.locWd, "
-            "span[class*='locWd'], "
-            "li[class*='location']"
+        # Read configuration from SSM
+        url = get_ssm_parameter(
+            "/data/url/webcrap"
         )
 
-        experience_tag = card.select_one(
-            "span.expwdth, "
-            "span[class*='expwdth'], "
-            "li[class*='experience']"
+        s3_bucket = get_ssm_parameter(
+            "/job-scraper/s3_bucket"
         )
 
-        job_title = (
-            title_tag.get_text(" ", strip=True)
-            if title_tag else None
+        success_arn = get_ssm_parameter(
+            "/data/successarn/webcrap"
         )
 
-        company_name = (
-            company_tag.get_text(" ", strip=True)
-            if company_tag else None
+        logger.info("SSM parameters loaded successfully")
+
+        # Scrape jobs
+        jobs = scrape_python_jobs(url)
+
+        # Create Excel file
+        file_path = os.path.join(
+            OUTPUT_DIR,
+            "jobs.xlsx"
         )
 
-        location = (
-            location_tag.get_text(" ", strip=True)
-            if location_tag else None
+        columns = [
+            "Job Title",
+            "Job URL",
+            "Company",
+            "Location",
+            "Posted Date"
+        ]
+
+        df = pd.DataFrame(jobs, columns=columns)
+        df.to_excel(file_path, index=False)
+
+        logger.info("Excel file created successfully")
+
+        # Upload to S3
+        s3_key = "python_jobs/jobs.xlsx"
+
+        s3_client.upload_file(
+            file_path,
+            s3_bucket,
+            s3_key
         )
 
-        experience = (
-            experience_tag.get_text(" ", strip=True)
-            if experience_tag else None
+        logger.info("Excel file uploaded to S3 successfully")
+
+        # Send success email
+        send_notification(
+            success_arn,
+            "Python Job Scraper - SUCCESS",
+            (
+                "Job scraping completed successfully.\n"
+                f"Total jobs found: {len(jobs)}\n"
+                "Excel file uploaded to the configured S3 location."
+            )
         )
 
-        if job_title:
-            jobs.append({
-                "Job Name": job_title,
-                "Company Name": company_name,
-                "Location": location,
-                "Experience": experience
-            })
+        return {
+            "statusCode": 200,
+            "body": "Scraping and S3 upload completed successfully.",
+            "job_count": len(jobs)
+        }
 
-    # 8. Create DataFrame
-    columns = [
-        "Job Name",
-        "Company Name",
-        "Location",
-        "Experience"
-    ]
+    except Exception as error:
+        logger.exception("Python job scraper failed")
 
-    df = pd.DataFrame(jobs, columns=columns)
+        # Send failure email when the failure ARN is available
+        if failure_arn:
+            try:
+                send_notification(
+                    failure_arn,
+                    "Python Job Scraper - FAILURE",
+                    (
+                        "Job scraping failed.\n"
+                        f"Error type: {type(error).__name__}\n"
+                        f"Error: {str(error)[:1000]}\n"
+                        f"Request ID: {context.aws_request_id}"
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to send SNS failure notification"
+                )
 
-    # 9. Save as CSV
-    df.to_csv(
-        file_path,
-        index=False,
-        encoding="utf-8-sig"
-    )
-
-    print("\nScraping completed.")
-    print(df.head(10).to_string(index=False))
-    print("\nTotal jobs extracted:", len(df))
-    print("CSV file saved at:", file_path)
-
-    if len(jobs) == 0:
-        print(
-            "\nNo job cards were detected. "
-            "Naukri's HTML selectors may have changed, "
-            "or the page may require verification."
-        )
-
-finally:
-    driver.quit()
+        # Mark the invocation as failed in Lambda
+        raise
